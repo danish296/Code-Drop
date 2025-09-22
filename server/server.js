@@ -82,7 +82,7 @@ cron.schedule('0 * * * *', () => {
 // --- Socket.IO Setup ---
 const io = new Server(server, {
   cors: {
-    origin: "*", // Using wildcard for simplicity, you should restrict this to your domain in production
+    origin: "https://code-drop-theta.vercel.app", // <-- Your Vercel URL
     methods: ["GET", "POST"]
   }
 });

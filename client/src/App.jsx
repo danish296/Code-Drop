@@ -100,7 +100,7 @@ function App() {
   };
 
   useEffect(() => {
-    socketRef.current = io('http://localhost:3001');
+    socketRef.current = io('https://code-drop.onrender.com'); // <-- Your Render URL
     const socket = socketRef.current;
     
     const createPeerConnection = () => {
