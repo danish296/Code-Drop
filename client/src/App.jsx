@@ -14,8 +14,14 @@ const servers = {
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' }
-  ]
+    { urls: 'stun:stun4.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    // Add TURN servers for better connectivity (you'll need to set these up or use a service)
+    // { urls: 'turn:your-turn-server.com:3478', username: 'user', credential: 'pass' }
+  ],
+  iceCandidatePoolSize: 10,
+  bundlePolicy: 'balanced',
+  rtcpMuxPolicy: 'require'
 };
 const CHUNK_SIZE = 16 * 1024;
 
@@ -41,6 +47,9 @@ function App() {
   const connectionTimeoutRef = useRef(null);
   const isConnectedRef = useRef(false);
   const isSenderRef = useRef(false);
+  const heartbeatIntervalRef = useRef(null);
+  const retryConnectionRef = useRef(0);
+  const maxRetries = 3;
   
   useEffect(() => { 
     document.documentElement.setAttribute('data-theme', theme); 
@@ -68,6 +77,12 @@ function App() {
     console.log('🧹 Cleaning up connection...');
     
     clearConnectionTimeout();
+    
+    // Clear heartbeat
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
     
     if (dataChannelRef.current) {
       try {
@@ -99,6 +114,18 @@ function App() {
         clearConnectionTimeout();
         isConnectedRef.current = true;
         
+        // Start heartbeat mechanism
+        heartbeatIntervalRef.current = setInterval(() => {
+          if (channel.readyState === 'open') {
+            try {
+              channel.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+            } catch (e) {
+              console.error('❌ Heartbeat ping failed:', e);
+              cleanupConnection();
+            }
+          }
+        }, 5000);
+        
         if (isSender && file) {
             setSenderStatus('✅ Connected! Click to send file');
         } else {
@@ -110,6 +137,22 @@ function App() {
         if (typeof event.data === 'string') {
             try {
                 const message = JSON.parse(event.data);
+                
+                if (message.type === 'ping') {
+                    // Respond to ping with pong
+                    try {
+                      channel.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+                    } catch (e) {
+                      console.error('❌ Failed to send pong:', e);
+                    }
+                    return;
+                }
+                
+                if (message.type === 'pong') {
+                    lastPongRef.current = Date.now();
+                    return;
+                }
+                
                 if (message.type === 'file-start') {
                     console.log('📥 File transfer starting:', message.fileName);
                     setReceiverStatus(`📥 Receiving: ${message.fileName}`);
@@ -214,11 +257,60 @@ function App() {
         pc.oniceconnectionstatechange = () => {
             console.log('🧊 ICE connection state:', pc.iceConnectionState);
             
-            if (pc.iceConnectionState === 'failed') {
+            if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+                console.log('✅ ICE connection established');
+                clearConnectionTimeout();
+                retryConnectionRef.current = 0; // Reset retry counter on success
+                
+            } else if (pc.iceConnectionState === 'failed') {
                 console.error('❌ ICE connection failed');
-                setSenderStatus('❌ Connection failed');
-                setReceiverStatus('❌ Connection failed');
-                cleanupConnection();
+                
+                // Try ICE restart if retries available
+                if (retryConnectionRef.current < maxRetries) {
+                    retryConnectionRef.current++;
+                    console.log(`🔄 Attempting ICE restart (attempt ${retryConnectionRef.current}/${maxRetries})...`);
+                    setSenderStatus(`🔄 Retrying connection (${retryConnectionRef.current}/${maxRetries})...`);
+                    setReceiverStatus(`🔄 Retrying connection (${retryConnectionRef.current}/${maxRetries})...`);
+                    
+                    if (pc.restartIce) {
+                        pc.restartIce();
+                    } else {
+                        // Manual restart - create new offer/answer
+                        setTimeout(async () => {
+                            try {
+                                if (isSenderRef.current && remoteUserIdRef.current) {
+                                    const offer = await pc.createOffer({ iceRestart: true });
+                                    await pc.setLocalDescription(offer);
+                                    socketRef.current.emit('offer', { sdp: offer, target: remoteUserIdRef.current });
+                                }
+                            } catch (e) {
+                                console.error('❌ Manual restart failed:', e);
+                                cleanupConnection();
+                            }
+                        }, 1000);
+                    }
+                } else {
+                    setSenderStatus('❌ Connection failed after retries');
+                    setReceiverStatus('❌ Connection failed after retries');
+                    cleanupConnection();
+                }
+                
+            } else if (pc.iceConnectionState === 'disconnected') {
+                console.warn('⚠️ ICE connection disconnected');
+                setSenderStatus('⚠️ Connection lost, retrying...');
+                setReceiverStatus('⚠️ Connection lost, retrying...');
+                
+                // Set timeout for reconnection
+                setTimeout(() => {
+                    if (pc.iceConnectionState === 'disconnected') {
+                        console.error('❌ Reconnection timeout');
+                        cleanupConnection();
+                    }
+                }, 10000);
+                
+            } else if (pc.iceConnectionState === 'closed') {
+                console.log('🔒 ICE connection closed');
+                isConnectedRef.current = false;
             }
         };
         
@@ -278,21 +370,53 @@ function App() {
         try {
             peerConnectionRef.current = createPeerConnection();
             
-            // Create data channel for sender
+            // Create data channel for sender with more robust configuration
             console.log('📡 Creating data channel for sender...');
             const dataChannel = peerConnectionRef.current.createDataChannel('file-transfer', {
                 ordered: true,
-                maxRetransmits: 3
+                maxPacketLifeTime: 3000,
+                maxRetransmits: null
             });
             
             dataChannelRef.current = dataChannel;
             setupDataChannelEvents(dataChannel, true);
             
-            console.log('📤 Creating and sending offer...');
-            const offer = await peerConnectionRef.current.createOffer();
+            // Wait for ICE gathering to complete or timeout
+            console.log('🧊 Waiting for ICE gathering...');
+            const gatheringPromise = new Promise((resolve) => {
+                if (peerConnectionRef.current.iceGatheringState === 'complete') {
+                    resolve();
+                    return;
+                }
+                
+                const timeout = setTimeout(() => {
+                    console.log('⏰ ICE gathering timeout, proceeding anyway');
+                    resolve();
+                }, 5000);
+                
+                peerConnectionRef.current.addEventListener('icegatheringstatechange', () => {
+                    if (peerConnectionRef.current.iceGatheringState === 'complete') {
+                        clearTimeout(timeout);
+                        resolve();
+                    }
+                });
+            });
+            
+            console.log('📤 Creating offer...');
+            const offer = await peerConnectionRef.current.createOffer({
+                offerToReceiveAudio: false,
+                offerToReceiveVideo: false
+            });
+            
+            console.log('📤 Setting local description...');
             await peerConnectionRef.current.setLocalDescription(offer);
             
-            socket.emit('offer', { sdp: offer, target: receiverId });
+            // Wait for ICE gathering with timeout
+            await gatheringPromise;
+            
+            console.log('📤 Sending offer with', peerConnectionRef.current.localDescription.sdp.split('\n').filter(line => line.includes('a=candidate')).length, 'ICE candidates');
+            socket.emit('offer', { sdp: peerConnectionRef.current.localDescription, target: receiverId });
+            
         } catch (error) {
             console.error('❌ Error in receiver-joined:', error);
             setSenderStatus('❌ Error setting up connection');
@@ -316,6 +440,7 @@ function App() {
         try {
             peerConnectionRef.current = createPeerConnection();
             
+            console.log('📥 Setting remote description...');
             await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(sdp));
             
             // Process any pending ICE candidates
@@ -329,11 +454,35 @@ function App() {
             }
             pendingIceCandidates.current = [];
             
+            // Wait for ICE gathering to complete or timeout
+            console.log('🧊 Creating answer and waiting for ICE gathering...');
             const answer = await peerConnectionRef.current.createAnswer();
             await peerConnectionRef.current.setLocalDescription(answer);
             
-            console.log('📤 Sending answer');
-            socket.emit('answer', { sdp: answer, target: senderId });
+            const gatheringPromise = new Promise((resolve) => {
+                if (peerConnectionRef.current.iceGatheringState === 'complete') {
+                    resolve();
+                    return;
+                }
+                
+                const timeout = setTimeout(() => {
+                    console.log('⏰ ICE gathering timeout, proceeding anyway');
+                    resolve();
+                }, 5000);
+                
+                peerConnectionRef.current.addEventListener('icegatheringstatechange', () => {
+                    if (peerConnectionRef.current.iceGatheringState === 'complete') {
+                        clearTimeout(timeout);
+                        resolve();
+                    }
+                });
+            });
+            
+            await gatheringPromise;
+            
+            console.log('📤 Sending answer with', peerConnectionRef.current.localDescription.sdp.split('\n').filter(line => line.includes('a=candidate')).length, 'ICE candidates');
+            socket.emit('answer', { sdp: peerConnectionRef.current.localDescription, target: senderId });
+            
         } catch (error) {
             console.error('❌ Error handling offer:', error);
             setReceiverStatus('❌ Error processing offer');
@@ -395,7 +544,27 @@ function App() {
         setReceiverStatus('✅ Joined room! Waiting for connection...');
     });
 
+    socket.on('pong', () => {
+        lastPongRef.current = Date.now();
+    });
+
+    // Add heartbeat mechanism for socket connection
+    const socketHeartbeat = setInterval(() => {
+        if (socketRef.current && socketRef.current.connected) {
+            socketRef.current.emit('ping');
+            
+            // Check if we haven't received a pong in too long
+            if (Date.now() - lastPongRef.current > 15000) {
+                console.error('❌ Socket heartbeat timeout');
+                cleanupConnection();
+                setSenderStatus('❌ Server connection lost');
+                setReceiverStatus('❌ Server connection lost');
+            }
+        }
+    }, 5000);
+
     return () => {
+        clearInterval(socketHeartbeat);
         cleanupConnection();
         if (socketRef.current) {
             socketRef.current.disconnect();
