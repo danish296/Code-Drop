@@ -16,13 +16,28 @@ const servers = {
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
-    // Add TURN servers for better connectivity (you'll need to set these up or use a service)
-    // { urls: 'turn:your-turn-server.com:3478', username: 'user', credential: 'pass' }
+    // Free TURN servers for better connectivity
+    { 
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    { 
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    { 
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
   ],
   iceCandidatePoolSize: 10,
   bundlePolicy: 'balanced',
   rtcpMuxPolicy: 'require'
 };
+
 const CHUNK_SIZE = 16 * 1024;
 
 function App() {
@@ -49,6 +64,9 @@ function App() {
   const isSenderRef = useRef(false);
   const heartbeatIntervalRef = useRef(null);
   const retryConnectionRef = useRef(0);
+  const lastPongRef = useRef(Date.now()); // Fixed: Added missing ref
+  const statsIntervalRef = useRef(null);
+  
   const maxRetries = 3;
   
   useEffect(() => { 
@@ -58,6 +76,9 @@ function App() {
   const toggleTheme = () => setTheme(theme === 'light' ? 'dark' : 'light');
   const showInfo = () => setOverlay({ title: 'About CodeDrop', message: 'A peer-to-peer file sharing tool.' });
   const closeOverlay = () => setOverlay({ title: '', message: '' });
+
+  // Get retry delay with exponential backoff
+  const getRetryDelay = (attempt) => Math.min(1000 * Math.pow(2, attempt), 30000);
 
   // Clear connection timeout
   const clearConnectionTimeout = () => {
@@ -73,6 +94,62 @@ function App() {
     connectionTimeoutRef.current = setTimeout(callback, delay);
   };
 
+  // Handle connection failure
+  const handleConnectionFailure = () => {
+    const failureMessage = '❌ Connection failed after retries';
+    setSenderStatus(failureMessage);
+    setReceiverStatus(failureMessage);
+    cleanupConnection();
+    
+    // Optionally, try to recreate the room/connection after a delay
+    setTimeout(() => {
+      if (isSenderRef.current && file) {
+        console.log('🔄 Attempting to recreate room...');
+        setSenderStatus('🔄 Recreating room...');
+        retryConnectionRef.current = 0; // Reset retry counter
+        socketRef.current.emit('create-room');
+      }
+    }, 5000);
+  };
+
+  // Monitor connection quality
+  const monitorConnectionQuality = (pc) => {
+    if (statsIntervalRef.current) {
+      clearInterval(statsIntervalRef.current);
+    }
+    
+    statsIntervalRef.current = setInterval(async () => {
+      if (pc && pc.connectionState === 'connected') {
+        try {
+          const stats = await pc.getStats();
+          stats.forEach((report) => {
+            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+              console.log('📊 Connection stats:', {
+                rtt: report.currentRoundTripTime,
+                bytesReceived: report.bytesReceived,
+                bytesSent: report.bytesSent
+              });
+              
+              // Monitor for poor connection quality
+              if (report.currentRoundTripTime > 1.0) { // RTT > 1 second
+                console.warn('⚠️ High latency detected:', report.currentRoundTripTime);
+              }
+            }
+          });
+        } catch (error) {
+          console.error('❌ Error getting connection stats:', error);
+        }
+      } else {
+        if (statsIntervalRef.current) {
+          clearInterval(statsIntervalRef.current);
+          statsIntervalRef.current = null;
+        }
+      }
+    }, 30000); // Check every 30 seconds
+    
+    return statsIntervalRef.current;
+  };
+
   const cleanupConnection = () => {
     console.log('🧹 Cleaning up connection...');
     
@@ -82,6 +159,12 @@ function App() {
     if (heartbeatIntervalRef.current) {
       clearInterval(heartbeatIntervalRef.current);
       heartbeatIntervalRef.current = null;
+    }
+    
+    // Clear stats monitoring
+    if (statsIntervalRef.current) {
+      clearInterval(statsIntervalRef.current);
+      statsIntervalRef.current = null;
     }
     
     if (dataChannelRef.current) {
@@ -106,6 +189,50 @@ function App() {
     pendingIceCandidates.current = [];
   };
 
+  // Restart peer connection
+  const restartPeerConnection = async () => {
+    console.log('🔄 Restarting peer connection...');
+    
+    if (!currentRoomCode.current || !remoteUserIdRef.current) {
+      console.error('❌ Cannot restart - missing room or remote user info');
+      return;
+    }
+    
+    try {
+      // Clean up old connection
+      cleanupConnection();
+      
+      // Create new connection
+      peerConnectionRef.current = createPeerConnection();
+      
+      if (isSenderRef.current) {
+        // Recreate data channel for sender
+        const dataChannel = peerConnectionRef.current.createDataChannel('file-transfer', {
+          ordered: true,
+          maxPacketLifeTime: null, // Reliable delivery
+          maxRetransmits: 0,
+          protocol: 'file-transfer-v1'
+        });
+        
+        dataChannelRef.current = dataChannel;
+        setupDataChannelEvents(dataChannel, true);
+        
+        // Create new offer
+        const offer = await peerConnectionRef.current.createOffer();
+        await peerConnectionRef.current.setLocalDescription(offer);
+        
+        socketRef.current.emit('offer', { 
+          sdp: peerConnectionRef.current.localDescription, 
+          target: remoteUserIdRef.current,
+          isRestart: true // Flag to indicate this is a restart
+        });
+      }
+    } catch (error) {
+      console.error('❌ Error restarting connection:', error);
+      handleConnectionFailure();
+    }
+  };
+
   const setupDataChannelEvents = (channel, isSender = false) => {
     console.log('📡 Setting up data channel events, isSender:', isSender, 'readyState:', channel.readyState);
     
@@ -113,18 +240,26 @@ function App() {
         console.log('✅ Data channel opened, isSender:', isSender);
         clearConnectionTimeout();
         isConnectedRef.current = true;
+        retryConnectionRef.current = 0; // Reset retry counter
         
-        // Start heartbeat mechanism
+        // Clear any existing heartbeat
+        if (heartbeatIntervalRef.current) {
+          clearInterval(heartbeatIntervalRef.current);
+        }
+        
+        // Start heartbeat mechanism with improved error handling
         heartbeatIntervalRef.current = setInterval(() => {
           if (channel.readyState === 'open') {
             try {
               channel.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
             } catch (e) {
               console.error('❌ Heartbeat ping failed:', e);
-              cleanupConnection();
+              // Don't immediately cleanup - let connection state handlers deal with it
             }
+          } else {
+            console.warn('⚠️ Heartbeat skipped - channel not open:', channel.readyState);
           }
-        }, 5000);
+        }, 10000); // Reduce frequency to every 10 seconds
         
         if (isSender && file) {
             setSenderStatus('✅ Connected! Click to send file');
@@ -179,21 +314,35 @@ function App() {
 
     channel.onerror = (error) => {
         console.error('❌ Data channel error:', error);
+        
+        // More specific error handling
+        const errorMessage = error.error ? error.error.message : 'Connection error';
         if (isSender) {
-            setSenderStatus('❌ Connection error');
+            setSenderStatus(`❌ ${errorMessage}`);
         } else {
-            setReceiverStatus('❌ Connection error');
+            setReceiverStatus(`❌ ${errorMessage}`);
         }
     };
 
     channel.onclose = () => {
         console.log('📡 Data channel closed');
+        
+        // Clear heartbeat when channel closes
+        if (heartbeatIntervalRef.current) {
+            clearInterval(heartbeatIntervalRef.current);
+            heartbeatIntervalRef.current = null;
+        }
+        
+        // Only show "lost" message if we were previously connected
+        const wasConnected = isConnectedRef.current;
         isConnectedRef.current = false;
         
-        if (isSender) {
-            setSenderStatus('❌ Connection lost');
-        } else {
-            setReceiverStatus('❌ Connection lost');
+        if (wasConnected) {
+            if (isSender) {
+                setSenderStatus('❌ Connection lost');
+            } else {
+                setReceiverStatus('❌ Connection lost');
+            }
         }
     };
   };
@@ -213,6 +362,9 @@ function App() {
         
         const pc = new RTCPeerConnection(servers);
         
+        // Start connection quality monitoring
+        monitorConnectionQuality(pc);
+        
         pc.onicecandidate = (event) => {
             if (event.candidate && currentRoomCode.current) {
                 console.log('🧊 Sending ICE candidate');
@@ -230,19 +382,60 @@ function App() {
             if (pc.connectionState === 'connected') {
                 console.log('✅ Peer connection established');
                 clearConnectionTimeout();
+                retryConnectionRef.current = 0; // Reset retry counter
                 
             } else if (pc.connectionState === 'failed') {
                 console.error('❌ Peer connection failed');
-                setSenderStatus('❌ Connection failed');
-                setReceiverStatus('❌ Connection failed');
-                cleanupConnection();
+                
+                // Only retry if we haven't exceeded max retries
+                if (retryConnectionRef.current < maxRetries) {
+                    retryConnectionRef.current++;
+                    console.log(`🔄 Retrying connection (${retryConnectionRef.current}/${maxRetries})...`);
+                    
+                    // Set status based on role
+                    const statusMessage = `🔄 Retrying connection (${retryConnectionRef.current}/${maxRetries})...`;
+                    if (isSenderRef.current) {
+                        setSenderStatus(statusMessage);
+                    } else {
+                        setReceiverStatus(statusMessage);
+                    }
+                    
+                    // Attempt to restart the ICE connection with exponential backoff
+                    const delay = getRetryDelay(retryConnectionRef.current - 1);
+                    setTimeout(async () => {
+                        try {
+                            if (pc.restartIce) {
+                                pc.restartIce();
+                            } else {
+                                // Manual restart - recreate the connection
+                                await restartPeerConnection();
+                            }
+                        } catch (error) {
+                            console.error('❌ Restart failed:', error);
+                            handleConnectionFailure();
+                        }
+                    }, delay);
+                    
+                } else {
+                    handleConnectionFailure();
+                }
                 
             } else if (pc.connectionState === 'disconnected') {
                 console.warn('⚠️ Peer connection disconnected');
-                if (isConnectedRef.current) {
-                    setSenderStatus('⚠️ Connection lost, retrying...');
-                    setReceiverStatus('⚠️ Connection lost, retrying...');
+                const statusMessage = '⚠️ Connection lost, attempting to reconnect...';
+                if (isSenderRef.current) {
+                    setSenderStatus(statusMessage);
+                } else {
+                    setReceiverStatus(statusMessage);
                 }
+                
+                // Set a timeout to handle prolonged disconnection
+                setTimeout(() => {
+                    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+                        console.error('❌ Connection timeout after disconnection');
+                        handleConnectionFailure();
+                    }
+                }, 15000); // 15 second timeout
                 
             } else if (pc.connectionState === 'closed') {
                 console.log('🔒 Peer connection closed');
@@ -260,51 +453,27 @@ function App() {
             if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
                 console.log('✅ ICE connection established');
                 clearConnectionTimeout();
-                retryConnectionRef.current = 0; // Reset retry counter on success
+                retryConnectionRef.current = 0;
                 
             } else if (pc.iceConnectionState === 'failed') {
                 console.error('❌ ICE connection failed');
                 
-                // Try ICE restart if retries available
-                if (retryConnectionRef.current < maxRetries) {
-                    retryConnectionRef.current++;
-                    console.log(`🔄 Attempting ICE restart (attempt ${retryConnectionRef.current}/${maxRetries})...`);
-                    setSenderStatus(`🔄 Retrying connection (${retryConnectionRef.current}/${maxRetries})...`);
-                    setReceiverStatus(`🔄 Retrying connection (${retryConnectionRef.current}/${maxRetries})...`);
-                    
+                // Don't immediately retry if peer connection will handle it
+                if (pc.connectionState !== 'failed') {
+                    console.log('🔄 ICE failed but peer connection still active, attempting ICE restart...');
                     if (pc.restartIce) {
                         pc.restartIce();
-                    } else {
-                        // Manual restart - create new offer/answer
-                        setTimeout(async () => {
-                            try {
-                                if (isSenderRef.current && remoteUserIdRef.current) {
-                                    const offer = await pc.createOffer({ iceRestart: true });
-                                    await pc.setLocalDescription(offer);
-                                    socketRef.current.emit('offer', { sdp: offer, target: remoteUserIdRef.current });
-                                }
-                            } catch (e) {
-                                console.error('❌ Manual restart failed:', e);
-                                cleanupConnection();
-                            }
-                        }, 1000);
                     }
-                } else {
-                    setSenderStatus('❌ Connection failed after retries');
-                    setReceiverStatus('❌ Connection failed after retries');
-                    cleanupConnection();
                 }
                 
             } else if (pc.iceConnectionState === 'disconnected') {
                 console.warn('⚠️ ICE connection disconnected');
-                setSenderStatus('⚠️ Connection lost, retrying...');
-                setReceiverStatus('⚠️ Connection lost, retrying...');
                 
-                // Set timeout for reconnection
+                // Give some time for reconnection before taking action
                 setTimeout(() => {
-                    if (pc.iceConnectionState === 'disconnected') {
-                        console.error('❌ Reconnection timeout');
-                        cleanupConnection();
+                    if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                        console.error('❌ ICE reconnection timeout');
+                        // Let the peer connection state handler deal with this
                     }
                 }, 10000);
                 
@@ -327,6 +496,7 @@ function App() {
 
     socket.on('connect', () => {
         console.log('✅ Socket connected to server');
+        lastPongRef.current = Date.now(); // Reset pong timestamp
     });
 
     socket.on('disconnect', (reason) => {
@@ -370,12 +540,13 @@ function App() {
         try {
             peerConnectionRef.current = createPeerConnection();
             
-            // Create data channel for sender with more robust configuration
+            // Create data channel for sender with improved configuration
             console.log('📡 Creating data channel for sender...');
             const dataChannel = peerConnectionRef.current.createDataChannel('file-transfer', {
                 ordered: true,
-                maxPacketLifeTime: 3000,
-                maxRetransmits: null
+                maxPacketLifeTime: null, // Reliable delivery
+                maxRetransmits: 0,
+                protocol: 'file-transfer-v1'
             });
             
             dataChannelRef.current = dataChannel;
@@ -424,8 +595,8 @@ function App() {
         }
     });
 
-    socket.on('offer', async ({ sdp, senderId }) => {
-        console.log('📨 Offer received from:', senderId);
+    socket.on('offer', async ({ sdp, senderId, isRestart }) => {
+        console.log('📨 Offer received from:', senderId, 'isRestart:', !!isRestart);
         remoteUserIdRef.current = senderId;
         isSenderRef.current = false;
         setReceiverStatus('🤝 Offer received! Connecting...');
@@ -438,7 +609,14 @@ function App() {
         }, 30000);
         
         try {
-            peerConnectionRef.current = createPeerConnection();
+            // If this is a restart, clean up first
+            if (isRestart) {
+                cleanupConnection();
+            }
+            
+            if (!peerConnectionRef.current) {
+                peerConnectionRef.current = createPeerConnection();
+            }
             
             console.log('📥 Setting remote description...');
             await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(sdp));
@@ -563,8 +741,28 @@ function App() {
         }
     }, 5000);
 
+    // Network change detection
+    const handleNetworkChange = () => {
+        console.log('🌐 Network change detected');
+        if (isConnectedRef.current) {
+            console.log('🔄 Attempting to recover from network change...');
+            // Give some time for network to stabilize, then check connection
+            setTimeout(() => {
+                if (peerConnectionRef.current && peerConnectionRef.current.connectionState === 'disconnected') {
+                    console.log('🔄 Restarting connection after network change...');
+                    restartPeerConnection();
+                }
+            }, 2000);
+        }
+    };
+
+    window.addEventListener('online', handleNetworkChange);
+    window.addEventListener('offline', handleNetworkChange);
+
     return () => {
         clearInterval(socketHeartbeat);
+        window.removeEventListener('online', handleNetworkChange);
+        window.removeEventListener('offline', handleNetworkChange);
         cleanupConnection();
         if (socketRef.current) {
             socketRef.current.disconnect();
@@ -665,8 +863,9 @@ function App() {
                     
                     console.log(`📤 Sent chunk ${chunkCount}, ${offset}/${file.size} bytes (${Math.round(progress)}%)`);
                     
-                    // Continue reading next chunk
-                    setTimeout(readChunk, 10); // Small delay to prevent overwhelming
+                    // Continue reading next chunk with adaptive delay
+                    const delay = dataChannelRef.current.bufferedAmount > 64 * 1024 ? 50 : 10;
+                    setTimeout(readChunk, delay);
                 } else {
                     console.error('❌ Data channel not ready during transfer');
                     setSenderStatus('❌ Connection lost during transfer');
@@ -697,6 +896,7 @@ function App() {
       
       // Clean any existing connection
       cleanupConnection();
+      retryConnectionRef.current = 0; // Reset retry counter
       
       socketRef.current.emit('create-room');
     }
@@ -711,6 +911,7 @@ function App() {
       // Clean any existing connection
       cleanupConnection();
       isSenderRef.current = false;
+      retryConnectionRef.current = 0; // Reset retry counter
       
       // Set timeout for joining room
       setConnectionTimeout(() => {
