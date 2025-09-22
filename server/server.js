@@ -46,39 +46,6 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   res.status(200).json({ link: fileUrl });
 });
 
-// --- Scheduled File Cleanup (Cron Job) ---
-// This task runs every hour to delete files older than 24 hours
-cron.schedule('0 * * * *', () => {
-  console.log('🧹 Running hourly cleanup job...');
-  fs.readdir(UPLOADS_DIR, (err, files) => {
-    if (err) {
-      console.error("Could not list the directory.", err);
-      return;
-    }
-
-    files.forEach((file, index) => {
-      const filePath = path.join(UPLOADS_DIR, file);
-      fs.stat(filePath, (err, stat) => {
-        if (err) {
-          console.error("Error stating file.", err);
-          return;
-        }
-
-        const now = new Date().getTime();
-        const twentyFourHours = 24 * 60 * 60 * 1000;
-        const fileAge = now - new Date(stat.mtime).getTime();
-
-        if (fileAge > twentyFourHours) {
-          console.log(`🗑️ Deleting old file: ${file}`);
-          fs.unlink(filePath, (err) => {
-            if (err) console.error(`Error deleting file: ${file}`, err);
-          });
-        }
-      });
-    });
-  });
-});
-
 // --- Socket.IO Setup ---
 const io = new Server(server, {
   cors: {
@@ -88,13 +55,17 @@ const io = new Server(server, {
   },
   transports: ['websocket', 'polling'],
   pingTimeout: 60000,
-  pingInterval: 25000
+  pingInterval: 25000,
+  upgradeTimeout: 30000,
+  allowUpgrades: true
 });
+
 const PORT = process.env.PORT || 3001;
 
 // Store room information with better structure
 const rooms = new Map();
 const userRooms = new Map(); // Track which room each user is in
+const heartbeats = new Map(); // Track heartbeats
 
 // Helper function to clean up a room
 const cleanupRoom = (roomCode, reason = 'cleanup') => {
@@ -113,9 +84,11 @@ const cleanupRoom = (roomCode, reason = 'cleanup') => {
     // Remove from tracking maps
     if (roomInfo.sender) {
       userRooms.delete(roomInfo.sender);
+      heartbeats.delete(roomInfo.sender);
     }
     if (roomInfo.receiver) {
       userRooms.delete(roomInfo.receiver);
+      heartbeats.delete(roomInfo.receiver);
     }
     
     rooms.delete(roomCode);
@@ -127,9 +100,49 @@ const getRoomInfo = (roomCode) => {
   return rooms.get(roomCode) || null;
 };
 
+// Room validation helper
+const validateRoom = (socket, roomCode, requiredRole = null) => {
+  const roomInfo = getRoomInfo(roomCode);
+  if (!roomInfo) {
+    socket.emit('error', 'Room not found');
+    return false;
+  }
+
+  if (requiredRole === 'sender' && roomInfo.sender !== socket.id) {
+    socket.emit('error', 'Unauthorized: Not the sender');
+    return false;
+  }
+
+  if (requiredRole === 'receiver' && roomInfo.receiver !== socket.id) {
+    socket.emit('error', 'Unauthorized: Not the receiver');
+    return false;
+  }
+
+  if (roomInfo.sender !== socket.id && roomInfo.receiver !== socket.id) {
+    socket.emit('error', 'Unauthorized: Not in this room');
+    return false;
+  }
+
+  return roomInfo;
+};
+
+// Global error handlers
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    // Don't exit the process in production
+    if (process.env.NODE_ENV !== 'production') {
+        process.exit(1);
+    }
+});
+
 // --- Enhanced Signaling Logic ---
 io.on('connection', (socket) => {
     console.log('✅ User connected:', socket.id);
+    heartbeats.set(socket.id, Date.now());
 
     // Clean up any existing room assignments for this socket
     const existingRoom = userRooms.get(socket.id);
@@ -145,11 +158,17 @@ io.on('connection', (socket) => {
                 cleanupRoom(existingRoom, 'new-room-created');
             }
 
-            const roomCode = Math.floor(1000 + Math.random() * 9000).toString();
+            let roomCode;
+            let attempts = 0;
             
             // Ensure room code is unique
-            if (rooms.has(roomCode)) {
-                socket.emit('create-room'); // Retry with new code
+            do {
+                roomCode = Math.floor(1000 + Math.random() * 9000).toString();
+                attempts++;
+            } while (rooms.has(roomCode) && attempts < 10);
+
+            if (attempts >= 10) {
+                socket.emit('error', 'Failed to generate unique room code');
                 return;
             }
 
@@ -187,6 +206,11 @@ io.on('connection', (socket) => {
 
     socket.on('join-room', (roomCode) => {
         try {
+            if (!roomCode || typeof roomCode !== 'string' || roomCode.length !== 4) {
+                socket.emit('error', 'Invalid room code');
+                return;
+            }
+
             const roomInfo = getRoomInfo(roomCode);
             const socketRoom = io.sockets.adapter.rooms.get(roomCode);
             
@@ -237,8 +261,7 @@ io.on('connection', (socket) => {
             // Notify the sender that receiver has joined
             if (roomInfo.sender && io.sockets.sockets.get(roomInfo.sender)) {
                 io.to(roomInfo.sender).emit('receiver-joined', { 
-                    receiverId: socket.id,
-                    roomCode: roomCode 
+                    receiverId: socket.id
                 });
             }
             
@@ -248,11 +271,12 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Enhanced WebRTC signaling with better error handling
+    // FIXED: Enhanced WebRTC signaling with proper message format
     socket.on('offer', (payload) => {
         try {
             if (!payload.target || !payload.sdp) {
                 console.error('❌ Invalid offer payload');
+                socket.emit('error', 'Invalid offer payload');
                 return;
             }
 
@@ -263,11 +287,8 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            const roomInfo = getRoomInfo(roomCode);
-            if (!roomInfo || roomInfo.sender !== socket.id) {
-                console.error('❌ Unauthorized offer from non-sender');
-                return;
-            }
+            const roomInfo = validateRoom(socket, roomCode, 'sender');
+            if (!roomInfo) return;
 
             console.log(`📤 Relaying offer from ${socket.id} to ${payload.target} in room ${roomCode}`);
             
@@ -281,11 +302,13 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            // FIXED: Send only what client expects
             io.to(payload.target).emit('offer', { 
                 sdp: payload.sdp, 
                 senderId: socket.id,
-                roomCode: roomCode
+                isRestart: payload.isRestart || false
             });
+
         } catch (error) {
             console.error('❌ Error handling offer:', error);
             socket.emit('error', 'Failed to process offer');
@@ -296,6 +319,7 @@ io.on('connection', (socket) => {
         try {
             if (!payload.target || !payload.sdp) {
                 console.error('❌ Invalid answer payload');
+                socket.emit('error', 'Invalid answer payload');
                 return;
             }
 
@@ -306,11 +330,8 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            const roomInfo = getRoomInfo(roomCode);
-            if (!roomInfo || roomInfo.receiver !== socket.id) {
-                console.error('❌ Unauthorized answer from non-receiver');
-                return;
-            }
+            const roomInfo = validateRoom(socket, roomCode, 'receiver');
+            if (!roomInfo) return;
 
             console.log(`📤 Relaying answer from ${socket.id} to ${payload.target} in room ${roomCode}`);
             
@@ -324,18 +345,18 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            // FIXED: Send only what client expects
             io.to(payload.target).emit('answer', { 
-                sdp: payload.sdp, 
-                receiverId: socket.id,
-                roomCode: roomCode
+                sdp: payload.sdp
             });
+
         } catch (error) {
             console.error('❌ Error handling answer:', error);
             socket.emit('error', 'Failed to process answer');
         }
     });
 
-    // Enhanced ICE candidate relay with validation
+    // FIXED: Enhanced ICE candidate relay
     socket.on('ice-candidate', (payload) => {
         try {
             if (!payload.candidate) {
@@ -349,11 +370,8 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            const roomInfo = getRoomInfo(roomCode);
-            if (!roomInfo) {
-                console.error('❌ Room not found for ICE candidate');
-                return;
-            }
+            const roomInfo = validateRoom(socket, roomCode);
+            if (!roomInfo) return;
 
             console.log(`🧊 Relaying ICE candidate from ${socket.id} in room ${roomCode}`);
             
@@ -368,22 +386,79 @@ io.on('connection', (socket) => {
                 }
                 
                 io.to(payload.target).emit('ice-candidate', { 
-                    candidate: payload.candidate,
-                    senderId: socket.id
+                    candidate: payload.candidate
                 });
             } else {
                 // Broadcast to room (excluding sender)
                 socket.broadcast.to(roomCode).emit('ice-candidate', { 
-                    candidate: payload.candidate,
-                    senderId: socket.id
+                    candidate: payload.candidate
                 });
             }
+
         } catch (error) {
             console.error('❌ Error handling ICE candidate:', error);
         }
     });
 
-    // Handle file transfer events (optional - for socket-based fallback)
+    // NEW: Connection state monitoring
+    socket.on('connection-state-change', (payload) => {
+        try {
+            const roomCode = userRooms.get(socket.id);
+            if (!roomCode) return;
+
+            const roomInfo = getRoomInfo(roomCode);
+            if (!roomInfo) return;
+
+            console.log(`🔗 Connection state change in room ${roomCode}:`, payload.state);
+            
+            // Update room activity
+            roomInfo.lastActivity = Date.now();
+
+            // Relay connection state to other peer
+            const otherUserId = roomInfo.sender === socket.id ? roomInfo.receiver : roomInfo.sender;
+            if (otherUserId && io.sockets.sockets.get(otherUserId)) {
+                io.to(otherUserId).emit('peer-connection-state', {
+                    state: payload.state,
+                    peerId: socket.id
+                });
+            }
+
+            // If connection failed, clean up room after a delay
+            if (payload.state === 'failed' || payload.state === 'closed') {
+                setTimeout(() => {
+                    if (rooms.has(roomCode)) {
+                        cleanupRoom(roomCode, 'connection-failed');
+                    }
+                }, 5000);
+            }
+        } catch (error) {
+            console.error('❌ Error handling connection state change:', error);
+        }
+    });
+
+    // NEW: Connection timeout handling
+    socket.on('connection-timeout', (payload) => {
+        console.log(`⏰ Connection timeout reported by ${socket.id}`);
+        const roomCode = userRooms.get(socket.id);
+        if (roomCode) {
+            cleanupRoom(roomCode, 'connection-timeout');
+        }
+    });
+
+    // Enhanced heartbeat mechanism
+    socket.on('ping', () => {
+        heartbeats.set(socket.id, Date.now());
+        const roomCode = userRooms.get(socket.id);
+        if (roomCode) {
+            const roomInfo = getRoomInfo(roomCode);
+            if (roomInfo) {
+                roomInfo.lastActivity = Date.now();
+            }
+        }
+        socket.emit('pong');
+    });
+
+    // Handle file transfer events (for socket-based fallback)
     socket.on('file-chunk', (payload) => {
         try {
             const roomCode = userRooms.get(socket.id);
@@ -426,22 +501,13 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Heartbeat mechanism
-    socket.on('ping', () => {
-        const roomCode = userRooms.get(socket.id);
-        if (roomCode) {
-            const roomInfo = getRoomInfo(roomCode);
-            if (roomInfo) {
-                roomInfo.lastActivity = Date.now();
-            }
-        }
-        socket.emit('pong');
-    });
-
     socket.on('disconnect', (reason) => {
         console.log('❌ User disconnected:', socket.id, 'Reason:', reason);
         
         try {
+            // Remove from heartbeat tracking
+            heartbeats.delete(socket.id);
+            
             // Clean up room if user was in one
             const roomCode = userRooms.get(socket.id);
             if (roomCode) {
@@ -476,6 +542,23 @@ io.on('connection', (socket) => {
         }
     });
 });
+
+// Enhanced heartbeat monitoring
+let heartbeatInterval = setInterval(() => {
+    const now = Date.now();
+    const heartbeatTimeout = 30000; // 30 seconds
+    
+    for (const [socketId, lastPing] of heartbeats.entries()) {
+        if (now - lastPing > heartbeatTimeout) {
+            console.log(`💔 Heartbeat timeout for ${socketId}`);
+            const socket = io.sockets.sockets.get(socketId);
+            if (socket) {
+                socket.disconnect(true);
+            }
+            heartbeats.delete(socketId);
+        }
+    }
+}, 15000); // Check every 15 seconds
 
 // Enhanced room cleanup - runs every 5 minutes
 cron.schedule('*/5 * * * *', () => {
@@ -565,13 +648,58 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     activeRooms: rooms.size,
     connectedSockets: io.sockets.sockets.size,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    heartbeatsTracked: heartbeats.size
+  });
+});
+
+// Enhanced health check with WebRTC diagnostics
+app.get('/health/webrtc', (req, res) => {
+  const roomsWithUsers = Array.from(rooms.entries()).map(([code, info]) => ({
+    code,
+    hasSender: !!info.sender,
+    hasReceiver: !!info.receiver,
+    age: Date.now() - info.created,
+    inactive: Date.now() - info.lastActivity
+  }));
+
+  res.json({
+    status: 'healthy',
+    rooms: roomsWithUsers,
+    totalRooms: rooms.size,
+    connectedSockets: io.sockets.sockets.size,
+    heartbeatsTracked: heartbeats.size
   });
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('🛑 SIGTERM received, shutting down gracefully');
+  
+  // Clear heartbeat interval
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+  }
+  
+  // Close all rooms
+  for (const [roomCode] of rooms.entries()) {
+    cleanupRoom(roomCode, 'server-shutdown');
+  }
+  
+  // Close server
+  server.close(() => {
+    console.log('✅ Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('🛑 SIGINT received, shutting down gracefully');
+  
+  // Clear heartbeat interval
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+  }
   
   // Close all rooms
   for (const [roomCode] of rooms.entries()) {
@@ -588,4 +716,5 @@ process.on('SIGTERM', () => {
 server.listen(PORT, () => {
   console.log(`📡 Signaling server running on port ${PORT}`);
   console.log(`🌐 Health check available at /health`);
+  console.log(`🔧 WebRTC diagnostics at /health/webrtc`);
 });
