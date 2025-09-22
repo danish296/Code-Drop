@@ -127,6 +127,11 @@ function App() {
     }
   };
 
+  // Run TURN server test on component mount
+  useEffect(() => {
+    testTurnServers();
+  }, []);
+
   // Get retry delay with exponential backoff
   const getRetryDelay = (attempt) => Math.min(1000 * Math.pow(2, attempt), 30000);
 
@@ -416,12 +421,26 @@ function App() {
         
         pc.onicecandidate = (event) => {
             if (event.candidate && currentRoomCode.current) {
-                console.log('🧊 Sending ICE candidate');
+                // Log candidate details for debugging
+                const candidate = event.candidate.candidate;
+                const candidateType = candidate.includes('typ relay') ? 'TURN' : 
+                                    candidate.includes('typ srflx') ? 'STUN' : 
+                                    candidate.includes('typ host') ? 'HOST' : 'UNKNOWN';
+                
+                console.log(`🧊 Sending ${candidateType} candidate:`, candidate.substring(0, 50) + '...');
+                
+                // Prioritize TURN candidates for better connectivity
+                const priority = candidate.includes('typ relay') ? 1 : 
+                               candidate.includes('typ srflx') ? 2 : 3;
+                
                 socket.emit('ice-candidate', { 
                     candidate: event.candidate, 
                     roomCode: currentRoomCode.current,
-                    target: remoteUserIdRef.current
+                    target: remoteUserIdRef.current,
+                    priority: priority
                 });
+            } else if (event.candidate === null) {
+                console.log('🧊 ICE gathering completed');
             }
         };
         
