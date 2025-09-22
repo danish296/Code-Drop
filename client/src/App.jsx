@@ -12,11 +12,8 @@ const servers = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' }, 
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
-    // Free TURN servers for better connectivity
+    // Multiple TURN servers for better reliability
     { 
       urls: 'turn:openrelay.metered.ca:80',
       username: 'openrelayproject',
@@ -31,11 +28,23 @@ const servers = {
       urls: 'turn:openrelay.metered.ca:443?transport=tcp',
       username: 'openrelayproject',
       credential: 'openrelayproject'
+    },
+    // Additional TURN servers for better coverage
+    {
+      urls: 'turn:relay.backups.cz',
+      username: 'webrtc',
+      credential: 'webrtc'
+    },
+    {
+      urls: 'turn:relay.backups.cz:443',
+      username: 'webrtc', 
+      credential: 'webrtc'
     }
   ],
   iceCandidatePoolSize: 10,
   bundlePolicy: 'balanced',
-  rtcpMuxPolicy: 'require'
+  rtcpMuxPolicy: 'require',
+  iceTransportPolicy: 'all' // Allow both STUN and TURN
 };
 
 const CHUNK_SIZE = 16 * 1024;
@@ -73,9 +82,50 @@ function App() {
     document.documentElement.setAttribute('data-theme', theme); 
   }, [theme]);
   
-  const toggleTheme = () => setTheme(theme === 'light' ? 'dark' : 'light');
-  const showInfo = () => setOverlay({ title: 'About CodeDrop', message: 'A peer-to-peer file sharing tool.' });
-  const closeOverlay = () => setOverlay({ title: '', message: '' });
+  // Test TURN server connectivity
+  const testTurnServers = async () => {
+    console.log('🧪 Testing TURN server connectivity...');
+    
+    try {
+      // Create a temporary peer connection to test TURN servers
+      const testPc = new RTCPeerConnection(servers);
+      let candidateTypes = [];
+      
+      testPc.onicecandidate = (event) => {
+        if (event.candidate) {
+          const candidate = event.candidate.candidate;
+          if (candidate.includes('typ relay')) {
+            candidateTypes.push('TURN/relay');
+          } else if (candidate.includes('typ srflx')) {
+            candidateTypes.push('STUN/srflx');
+          } else if (candidate.includes('typ host')) {
+            candidateTypes.push('host');
+          }
+        }
+      };
+      
+      // Create a dummy data channel to trigger ICE gathering
+      testPc.createDataChannel('test');
+      const offer = await testPc.createOffer();
+      await testPc.setLocalDescription(offer);
+      
+      // Wait for ICE gathering
+      setTimeout(() => {
+        console.log('🔍 Available candidate types:', [...new Set(candidateTypes)]);
+        if (!candidateTypes.includes('TURN/relay')) {
+          console.warn('⚠️ No TURN relay candidates found - connection may fail behind symmetric NAT');
+          setOverlay({
+            title: 'Connection Warning',
+            message: 'TURN servers may be unavailable. Connection might fail if both users are behind restrictive firewalls.'
+          });
+        }
+        testPc.close();
+      }, 5000);
+      
+    } catch (error) {
+      console.error('❌ Error testing TURN servers:', error);
+    }
+  };
 
   // Get retry delay with exponential backoff
   const getRetryDelay = (attempt) => Math.min(1000 * Math.pow(2, attempt), 30000);
@@ -366,12 +416,26 @@ function App() {
         
         pc.onicecandidate = (event) => {
             if (event.candidate && currentRoomCode.current) {
-                console.log('🧊 Sending ICE candidate');
+                // Log candidate details for debugging
+                const candidate = event.candidate.candidate;
+                const candidateType = candidate.includes('typ relay') ? 'TURN' : 
+                                    candidate.includes('typ srflx') ? 'STUN' : 
+                                    candidate.includes('typ host') ? 'HOST' : 'UNKNOWN';
+                
+                console.log(`🧊 Sending ${candidateType} candidate:`, candidate.substring(0, 50) + '...');
+                
+                // Prioritize TURN candidates for better connectivity
+                const priority = candidate.includes('typ relay') ? 1 : 
+                               candidate.includes('typ srflx') ? 2 : 3;
+                
                 socket.emit('ice-candidate', { 
                     candidate: event.candidate, 
                     roomCode: currentRoomCode.current,
-                    target: remoteUserIdRef.current
+                    target: remoteUserIdRef.current,
+                    priority: priority
                 });
+            } else if (event.candidate === null) {
+                console.log('🧊 ICE gathering completed');
             }
         };
         
@@ -457,28 +521,72 @@ function App() {
             } else if (pc.iceConnectionState === 'failed') {
                 console.error('❌ ICE connection failed');
                 
-                // Don't immediately retry if peer connection will handle it
-                if (pc.connectionState !== 'failed') {
-                    console.log('🔄 ICE failed but peer connection still active, attempting ICE restart...');
-                    if (pc.restartIce) {
-                        pc.restartIce();
+                // More aggressive ICE restart for failed connections
+                if (retryConnectionRef.current < maxRetries) {
+                    retryConnectionRef.current++;
+                    console.log(`🔄 ICE failed - attempting restart (${retryConnectionRef.current}/${maxRetries})...`);
+                    
+                    const statusMessage = `🔄 Connection failed, retrying (${retryConnectionRef.current}/${maxRetries})...`;
+                    if (isSenderRef.current) {
+                        setSenderStatus(statusMessage);
+                    } else {
+                        setReceiverStatus(statusMessage);
                     }
+                    
+                    // Force ICE restart immediately
+                    setTimeout(async () => {
+                        try {
+                            if (pc.restartIce) {
+                                pc.restartIce();
+                            } else {
+                                // Complete connection restart
+                                await restartPeerConnection();
+                            }
+                        } catch (error) {
+                            console.error('❌ ICE restart failed:', error);
+                            handleConnectionFailure();
+                        }
+                    }, 1000); // Immediate retry for ICE failures
+                } else {
+                    handleConnectionFailure();
                 }
                 
             } else if (pc.iceConnectionState === 'disconnected') {
                 console.warn('⚠️ ICE connection disconnected');
                 
-                // Give some time for reconnection before taking action
-                setTimeout(() => {
-                    if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
-                        console.error('❌ ICE reconnection timeout');
-                        // Let the peer connection state handler deal with this
+                // Start countdown for disconnected state
+                const disconnectTimeout = setTimeout(() => {
+                    if (pc.iceConnectionState === 'disconnected') {
+                        console.error('❌ ICE reconnection timeout - forcing restart');
+                        // Treat prolonged disconnection as failure
+                        if (retryConnectionRef.current < maxRetries) {
+                            retryConnectionRef.current++;
+                            restartPeerConnection();
+                        } else {
+                            handleConnectionFailure();
+                        }
                     }
-                }, 10000);
+                }, 5000); // Shorter timeout for disconnected state
+                
+                // Store timeout reference to clear if state changes
+                pc._disconnectTimeout = disconnectTimeout;
+                
+            } else if (pc.iceConnectionState === 'checking') {
+                console.log('🔍 ICE connection checking...');
+                // Clear any existing disconnect timeout
+                if (pc._disconnectTimeout) {
+                    clearTimeout(pc._disconnectTimeout);
+                    pc._disconnectTimeout = null;
+                }
                 
             } else if (pc.iceConnectionState === 'closed') {
                 console.log('🔒 ICE connection closed');
                 isConnectedRef.current = false;
+                // Clear any timeouts
+                if (pc._disconnectTimeout) {
+                    clearTimeout(pc._disconnectTimeout);
+                    pc._disconnectTimeout = null;
+                }
             }
         };
         
@@ -574,7 +682,8 @@ function App() {
             console.log('📤 Creating offer...');
             const offer = await peerConnectionRef.current.createOffer({
                 offerToReceiveAudio: false,
-                offerToReceiveVideo: false
+                offerToReceiveVideo: false,
+                iceRestart: retryConnectionRef.current > 0 // Force ICE restart on retries
             });
             
             console.log('📤 Setting local description...');
