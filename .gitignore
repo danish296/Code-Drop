@@ -1,0 +1,17 @@
+/node_modules
+/client/node_modules
+/client/dist
+/client/.vite
+/server/node_modules
+/server/uploads
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.env
+.env.local
+.env.*.local
+.idea
+.vscode
+.DS_Store
+Thumbs.db
