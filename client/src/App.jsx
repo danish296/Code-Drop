@@ -12,7 +12,9 @@ const servers = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' }, 
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' }
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' }
   ]
 };
 const CHUNK_SIZE = 16 * 1024;
@@ -36,6 +38,9 @@ function App() {
   const remoteUserIdRef = useRef(null);
   const fileInfoRef = useRef({ name: '', size: 0 });
   const pendingIceCandidates = useRef([]);
+  const connectionTimeoutRef = useRef(null);
+  const isConnectedRef = useRef(false);
+  const isSenderRef = useRef(false);
   
   useEffect(() => { 
     document.documentElement.setAttribute('data-theme', theme); 
@@ -45,11 +50,55 @@ function App() {
   const showInfo = () => setOverlay({ title: 'About CodeDrop', message: 'A peer-to-peer file sharing tool.' });
   const closeOverlay = () => setOverlay({ title: '', message: '' });
 
+  // Clear connection timeout
+  const clearConnectionTimeout = () => {
+    if (connectionTimeoutRef.current) {
+      clearTimeout(connectionTimeoutRef.current);
+      connectionTimeoutRef.current = null;
+    }
+  };
+
+  // Set connection timeout
+  const setConnectionTimeout = (callback, delay = 30000) => {
+    clearConnectionTimeout();
+    connectionTimeoutRef.current = setTimeout(callback, delay);
+  };
+
+  const cleanupConnection = () => {
+    console.log('🧹 Cleaning up connection...');
+    
+    clearConnectionTimeout();
+    
+    if (dataChannelRef.current) {
+      try {
+        dataChannelRef.current.close();
+      } catch (e) {
+        console.error('Error closing data channel:', e);
+      }
+      dataChannelRef.current = null;
+    }
+    
+    if (peerConnectionRef.current) {
+      try {
+        peerConnectionRef.current.close();
+      } catch (e) {
+        console.error('Error closing peer connection:', e);
+      }
+      peerConnectionRef.current = null;
+    }
+    
+    isConnectedRef.current = false;
+    pendingIceCandidates.current = [];
+  };
+
   const setupDataChannelEvents = (channel, isSender = false) => {
     console.log('📡 Setting up data channel events, isSender:', isSender, 'readyState:', channel.readyState);
     
     channel.onopen = () => {
         console.log('✅ Data channel opened, isSender:', isSender);
+        clearConnectionTimeout();
+        isConnectedRef.current = true;
+        
         if (isSender && file) {
             setSenderStatus('✅ Connected! Click to send file');
         } else {
@@ -96,20 +145,28 @@ function App() {
 
     channel.onclose = () => {
         console.log('📡 Data channel closed');
+        isConnectedRef.current = false;
+        
+        if (isSender) {
+            setSenderStatus('❌ Connection lost');
+        } else {
+            setReceiverStatus('❌ Connection lost');
+        }
     };
   };
 
   useEffect(() => {
-    socketRef.current = io('https://code-drop.onrender.com'); // <-- Your Render URL
+    socketRef.current = io('https://code-drop.onrender.com', {
+      transports: ['websocket', 'polling'],
+      timeout: 10000,
+      forceNew: true
+    });
     const socket = socketRef.current;
     
     const createPeerConnection = () => {
         console.log('🔄 Creating peer connection...');
         
-        // Close existing connection if any
-        if (peerConnectionRef.current) {
-            peerConnectionRef.current.close();
-        }
+        cleanupConnection();
         
         const pc = new RTCPeerConnection(servers);
         
@@ -126,18 +183,42 @@ function App() {
         
         pc.onconnectionstatechange = () => {
             console.log('🔗 Connection state:', pc.connectionState);
+            
             if (pc.connectionState === 'connected') {
                 console.log('✅ Peer connection established');
-                // Additional check: if we have a file and this is the sender, update status
-                if (file && dataChannelRef.current) {
-                    console.log('📡 Data channel state:', dataChannelRef.current.readyState);
-                    if (dataChannelRef.current.readyState === 'open') {
-                        setSenderStatus('✅ Connected! Click to send file');
-                    }
-                }
-            } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                clearConnectionTimeout();
+                
+            } else if (pc.connectionState === 'failed') {
+                console.error('❌ Peer connection failed');
                 setSenderStatus('❌ Connection failed');
                 setReceiverStatus('❌ Connection failed');
+                cleanupConnection();
+                
+            } else if (pc.connectionState === 'disconnected') {
+                console.warn('⚠️ Peer connection disconnected');
+                if (isConnectedRef.current) {
+                    setSenderStatus('⚠️ Connection lost, retrying...');
+                    setReceiverStatus('⚠️ Connection lost, retrying...');
+                }
+                
+            } else if (pc.connectionState === 'closed') {
+                console.log('🔒 Peer connection closed');
+                isConnectedRef.current = false;
+            }
+        };
+
+        pc.onicegatheringstatechange = () => {
+            console.log('🧊 ICE gathering state:', pc.iceGatheringState);
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            console.log('🧊 ICE connection state:', pc.iceConnectionState);
+            
+            if (pc.iceConnectionState === 'failed') {
+                console.error('❌ ICE connection failed');
+                setSenderStatus('❌ Connection failed');
+                setReceiverStatus('❌ Connection failed');
+                cleanupConnection();
             }
         };
         
@@ -152,16 +233,34 @@ function App() {
         return pc;
     };
 
+    socket.on('connect', () => {
+        console.log('✅ Socket connected to server');
+    });
+
+    socket.on('disconnect', (reason) => {
+        console.log('❌ Socket disconnected:', reason);
+        cleanupConnection();
+        setSenderStatus('❌ Server disconnected');
+        setReceiverStatus('❌ Server disconnected');
+    });
+
     socket.on('room-created', (code) => { 
         console.log('🚀 Room created:', code);
         setSharingCode(code); 
         currentRoomCode.current = code; 
+        isSenderRef.current = true;
         setSenderStatus('Waiting for receiver to join...');
+        
+        // Set timeout for waiting for receiver
+        setConnectionTimeout(() => {
+            setSenderStatus('❌ No receiver joined. Try again.');
+        }, 60000);
     });
     
     socket.on('error', (message) => {
         console.error('❌ Socket error:', message);
         setOverlay({ title: 'Error', message });
+        cleanupConnection();
     });
 
     socket.on('receiver-joined', async ({ receiverId }) => {
@@ -169,26 +268,25 @@ function App() {
         remoteUserIdRef.current = receiverId;
         setSenderStatus('🤝 Receiver connected! Setting up P2P...');
         
+        // Set timeout for P2P connection establishment
+        setConnectionTimeout(() => {
+            console.error('❌ P2P connection timeout');
+            setSenderStatus('❌ Connection timeout');
+            cleanupConnection();
+        }, 30000);
+        
         try {
             peerConnectionRef.current = createPeerConnection();
             
             // Create data channel for sender
             console.log('📡 Creating data channel for sender...');
             const dataChannel = peerConnectionRef.current.createDataChannel('file-transfer', {
-                ordered: true
+                ordered: true,
+                maxRetransmits: 3
             });
             
             dataChannelRef.current = dataChannel;
             setupDataChannelEvents(dataChannel, true);
-            
-            // Add a small delay to ensure data channel is ready
-            setTimeout(() => {
-                if (dataChannel.readyState === 'open') {
-                    setSenderStatus('✅ Connected! Click to send file');
-                } else {
-                    console.log('⏳ Data channel not open yet, state:', dataChannel.readyState);
-                }
-            }, 1000);
             
             console.log('📤 Creating and sending offer...');
             const offer = await peerConnectionRef.current.createOffer();
@@ -198,13 +296,22 @@ function App() {
         } catch (error) {
             console.error('❌ Error in receiver-joined:', error);
             setSenderStatus('❌ Error setting up connection');
+            cleanupConnection();
         }
     });
 
     socket.on('offer', async ({ sdp, senderId }) => {
         console.log('📨 Offer received from:', senderId);
         remoteUserIdRef.current = senderId;
+        isSenderRef.current = false;
         setReceiverStatus('🤝 Offer received! Connecting...');
+        
+        // Set timeout for connection establishment
+        setConnectionTimeout(() => {
+            console.error('❌ Connection timeout');
+            setReceiverStatus('❌ Connection timeout');
+            cleanupConnection();
+        }, 30000);
         
         try {
             peerConnectionRef.current = createPeerConnection();
@@ -230,6 +337,7 @@ function App() {
         } catch (error) {
             console.error('❌ Error handling offer:', error);
             setReceiverStatus('❌ Error processing offer');
+            cleanupConnection();
         }
     });
 
@@ -239,7 +347,6 @@ function App() {
             if (peerConnectionRef.current && peerConnectionRef.current.signalingState === 'have-local-offer') {
                 await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(sdp));
                 console.log('✅ Remote description set successfully');
-                setSenderStatus('🔗 Connection established!');
                 
                 // Process any pending ICE candidates
                 for (const candidate of pendingIceCandidates.current) {
@@ -255,6 +362,7 @@ function App() {
         } catch (error) {
             console.error('❌ Error handling answer:', error);
             setSenderStatus('❌ Error processing answer');
+            cleanupConnection();
         }
     });
 
@@ -262,7 +370,7 @@ function App() {
         console.log('🧊 ICE candidate received');
         if (candidate && peerConnectionRef.current) {
             try {
-                if (peerConnectionRef.current.remoteDescription) {
+                if (peerConnectionRef.current.remoteDescription && peerConnectionRef.current.remoteDescription.type) {
                     await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
                     console.log('✅ ICE candidate added successfully');
                 } else {
@@ -275,12 +383,22 @@ function App() {
         }
     });
 
+    socket.on('peer-disconnected', () => {
+        console.log('👋 Peer disconnected');
+        cleanupConnection();
+        setSenderStatus('👋 Peer disconnected');
+        setReceiverStatus('👋 Peer disconnected');
+    });
+
+    socket.on('room-joined', (roomCode) => {
+        console.log('✅ Successfully joined room:', roomCode);
+        setReceiverStatus('✅ Joined room! Waiting for connection...');
+    });
+
     return () => {
+        cleanupConnection();
         if (socketRef.current) {
             socketRef.current.disconnect();
-        }
-        if (peerConnectionRef.current) {
-            peerConnectionRef.current.close();
         }
     };
   }, []); // Empty dependency array - socket should only be created once
@@ -368,17 +486,22 @@ function App() {
 
         fileReader.onload = (event) => {
             try {
-                dataChannelRef.current.send(event.target.result);
-                chunkCount++;
-                offset += event.target.result.byteLength;
-                
-                const progress = Math.min((offset / file.size) * 100, 100);
-                setTransferProgress(Math.round(progress));
-                
-                console.log(`📤 Sent chunk ${chunkCount}, ${offset}/${file.size} bytes (${Math.round(progress)}%)`);
-                
-                // Continue reading next chunk
-                setTimeout(readChunk, 0); // Use setTimeout to prevent call stack overflow
+                if (dataChannelRef.current && dataChannelRef.current.readyState === 'open') {
+                    dataChannelRef.current.send(event.target.result);
+                    chunkCount++;
+                    offset += event.target.result.byteLength;
+                    
+                    const progress = Math.min((offset / file.size) * 100, 100);
+                    setTransferProgress(Math.round(progress));
+                    
+                    console.log(`📤 Sent chunk ${chunkCount}, ${offset}/${file.size} bytes (${Math.round(progress)}%)`);
+                    
+                    // Continue reading next chunk
+                    setTimeout(readChunk, 10); // Small delay to prevent overwhelming
+                } else {
+                    console.error('❌ Data channel not ready during transfer');
+                    setSenderStatus('❌ Connection lost during transfer');
+                }
             } catch (error) {
                 console.error('❌ Error sending chunk:', error);
                 setSenderStatus('❌ Error sending file');
@@ -402,6 +525,10 @@ function App() {
       console.log('📁 File selected:', selectedFile.name, selectedFile.size, 'bytes');
       setFile(selectedFile);
       setSenderStatus('Creating room...');
+      
+      // Clean any existing connection
+      cleanupConnection();
+      
       socketRef.current.emit('create-room');
     }
   };
@@ -411,6 +538,16 @@ function App() {
       console.log('🚪 Attempting to join room:', roomCode);
       currentRoomCode.current = roomCode;
       setReceiverStatus('⏳ Joining room...');
+      
+      // Clean any existing connection
+      cleanupConnection();
+      isSenderRef.current = false;
+      
+      // Set timeout for joining room
+      setConnectionTimeout(() => {
+        setReceiverStatus('❌ Failed to join room');
+      }, 10000);
+      
       socketRef.current.emit('join-room', roomCode);
     } else {
       setOverlay({ title: 'Invalid Code', message: 'Please enter a valid 4-digit code.' });
@@ -430,7 +567,7 @@ function App() {
             receiverStatus={receiverStatus} 
             transferProgress={transferProgress}
             onSendFile={sendFile}
-            canSendFile={dataChannelRef.current && dataChannelRef.current.readyState === 'open'}
+            canSendFile={dataChannelRef.current && dataChannelRef.current.readyState === 'open' && isConnectedRef.current}
           />
         );
       case 'upload':
