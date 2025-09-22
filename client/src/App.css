@@ -1,0 +1,125 @@
+/* --- Layout --- */
+.app-layout {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+.main-content {
+  flex-grow: 1;
+  width: 100%;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 4rem 2rem;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+/* --- Navbar --- */
+.navbar { display: flex; justify-content: space-between; align-items: center; padding: 1rem 2rem; background-color: var(--surface); border-bottom: 1px solid var(--border-color); transition: background-color 0.3s ease, border-color 0.3s ease; }
+.navbar-left, .navbar-right { display: flex; align-items: center; gap: 1rem; }
+.logo-container { display: flex; align-items: center; gap: 0.5rem; color: var(--on-background); text-decoration: none; }
+.logo-container h1 { font-size: 1.5rem; margin: 0; }
+
+/* --- Footer (Fixed) --- */
+.footer { background-color: var(--surface); border-top: 1px solid var(--border-color); padding: 0 2rem; transition: background-color 0.3s ease, border-color 0.3s ease; position: relative; overflow: hidden; }
+.footer-content { display: flex; justify-content: space-between; align-items: center; height: 50px; }
+.footer-content p { margin: 0; font-size: 0.9rem; color: var(--subtle-text); }
+.scan-bar { height: 2px; background: linear-gradient(90deg, transparent, var(--secondary), transparent); animation: scan 4s linear infinite; }
+@keyframes scan { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+
+/* --- Buttons --- */
+.icon-button { background: none; border: none; cursor: pointer; color: var(--subtle-text); padding: 0.5rem; border-radius: 50%; display: flex; align-items: center; justify-content: center; transition: background-color 0.2s, color 0.2s; }
+.icon-button:hover { background-color: var(--border-color); color: var(--on-surface); }
+.button-primary { background-color: var(--primary); color: #fff; border: none; padding: 12px 24px; border-radius: 8px; font-size: 1rem; cursor: pointer; transition: background-color 0.2s; }
+.button-primary:hover { background-color: var(--primary-variant); }
+
+/* --- Mode Selector --- */
+.mode-selector-container { display: flex; flex-wrap: wrap; gap: 2rem; width: 100%; }
+.mode-card { flex: 1; min-width: 250px; background: var(--surface); border: 1px solid var(--border-color); border-radius: 16px; padding: 2.5rem; text-align: center; cursor: pointer; transition: all 0.2s ease-in-out; }
+.mode-card:hover { transform: translateY(-5px); box-shadow: 0 10px 20px rgba(0,0,0,0.1); border-color: var(--primary); }
+.mode-card-icon { color: var(--primary); margin-bottom: 1rem; }
+.mode-card h2 { margin: 0 0 0.5rem 0; color: var(--on-surface); }
+.mode-card p { margin: 0; color: var(--subtle-text); }
+
+/* --- Sharing & Dropzone (Fixed) --- */
+.sharing-container { width: 100%; max-width: 500px; text-align: center; }
+.dropzone { width: 100%; box-sizing: border-box; border: 2px dashed var(--dropzone-border); border-radius: 12px; padding: 3rem; cursor: pointer; background: var(--surface); transition: all 0.2s; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+.dropzone:hover { border-color: var(--primary); background-color: rgba(187, 134, 252, 0.05); }
+.dropzone h2 { margin: 0 0 1rem 0; color: var(--on-surface); }
+.dropzone p { margin: 0; font-size: 1rem; }
+.dropzone-subtext { color: var(--subtle-text); font-size: 0.9rem; margin-top: 0.25rem; }
+
+/* --- Info/Receiver Containers --- */
+.file-info-container, .receiver-container { background: var(--surface); border: 1px solid var(--border-color); border-radius: 16px; padding: 2.5rem; }
+.sharing-code-wrapper { margin: 1.5rem 0; position: relative; }
+.sharing-code { display: inline-flex; align-items: center; gap: 0.5rem; background: var(--background); border: 1px solid var(--border-color); padding: 1rem; font-size: 2rem; font-weight: bold; color: var(--secondary); letter-spacing: 0.3em; border-radius: 8px; cursor: pointer; }
+.copied-feedback { position: absolute; bottom: -30px; left: 50%; transform: translateX(-50%); background: var(--primary); color: #000; padding: 4px 10px; border-radius: 4px; font-size: 0.8rem; }
+.file-name { font-weight: bold; word-break: break-all; }
+.code-input { flex-grow: 1; background: var(--background); border: 1px solid var(--border-color); border-radius: 8px; color: var(--on-surface); padding: 0.8em; text-align: center; font-size: 1.2rem; letter-spacing: 0.5em; }
+.receiver-input-group { display: flex; width: 100%; gap: 10px; }
+.role-switcher { margin-top: 1.5rem; color: var(--subtle-text); }
+.role-switcher button { background: none; border: none; color: var(--primary); cursor: pointer; font-size: inherit; text-decoration: underline; padding: 0; }
+.status-text { color: var(--subtle-text); min-height: 1.2em; }
+.transfer-progress { width: 100%; margin: 1rem 0; height: 8px; border-radius: 4px; border: none; }
+.transfer-progress::-webkit-progress-bar { background-color: var(--background); border-radius: 4px; }
+.transfer-progress::-webkit-progress-value { background-color: var(--secondary); border-radius: 4px; transition: width 0.1s linear; }
+.receiver-status { margin-top: 2rem; width: 100%; }
+
+/* --- Overlay Styles --- */
+.overlay-backdrop { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.7); display: flex; justify-content: center; align-items: center; z-index: 1000; backdrop-filter: blur(5px); animation: fadeIn 0.3s ease; }
+.overlay-content { background-color: var(--surface); padding: 2rem; border-radius: 16px; border: 1px solid var(--border-color); width: 90%; max-width: 400px; text-align: center; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2); transform: scale(0.95); animation: scaleIn 0.3s ease forwards; }
+.overlay-title { color: var(--on-surface); margin: 0 0 1rem 0; }
+.overlay-message { color: var(--subtle-text); margin: 0 0 2rem 0; line-height: 1.6; }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes scaleIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+/* ADD THESE STYLES TO THE END OF YOUR App.css FILE */
+
+/* --- Shareable Link Styles --- */
+.shareable-link-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background-color: var(--background);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.25rem 0.5rem;
+  margin-top: 1rem;
+}
+
+.shareable-link-input {
+  flex-grow: 1;
+  background: none;
+  border: none;
+  color: var(--on-background);
+  font-size: 0.9rem;
+  padding: 0.5rem;
+  outline: none;
+}
+
+.link-copied {
+    position: static; /* Override previous positioning */
+    transform: none;
+    margin-top: 0.5rem;
+  
+  .send-file-button {
+  background: #4CAF50;
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 16px;
+  margin: 10px 0;
+  transition: background-color 0.3s;
+}
+
+.send-file-button:hover {
+  background: #45a049;
+}
+
+.send-file-button:disabled {
+  background: #cccccc;
+  cursor: not-allowed;
+}  display: inline-block;
+}
