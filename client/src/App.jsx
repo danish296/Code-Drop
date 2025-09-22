@@ -209,8 +209,7 @@ function App() {
         // Recreate data channel for sender
         const dataChannel = peerConnectionRef.current.createDataChannel('file-transfer', {
           ordered: true,
-          maxPacketLifeTime: null, // Reliable delivery
-          maxRetransmits: 0,
+          maxRetransmits: 0, // Reliable delivery - use retransmits only
           protocol: 'file-transfer-v1'
         });
         
@@ -544,8 +543,7 @@ function App() {
             console.log('📡 Creating data channel for sender...');
             const dataChannel = peerConnectionRef.current.createDataChannel('file-transfer', {
                 ordered: true,
-                maxPacketLifeTime: null, // Reliable delivery
-                maxRetransmits: 0,
+                maxRetransmits: 0, // Reliable delivery - use retransmits only
                 protocol: 'file-transfer-v1'
             });
             
